@@ -15,7 +15,10 @@ from urllib.parse import urlparse, parse_qs, urlencode
 
 import aiohttp
 import socketio
-import ptyprocess
+try:
+    import ptyprocess
+except ImportError:
+    ptyprocess = None  # Windows: terminal WebSocket unavailable
 from aiohttp import web
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -778,6 +781,8 @@ class TerminalSession:
 
 async def terminal_ws_handler(request: web.Request) -> web.WebSocketResponse:
     """WebSocket handler for /api/ga/terminal — multi-session xterm.js via ptyprocess."""
+    if ptyprocess is None:
+        return web.json_response({'error': 'Terminal not available on this platform'}, status=503)
     ws = web.WebSocketResponse(max_msg_size=0)
     await ws.prepare(request)
     log.info('[terminal] WebSocket connected')
@@ -982,7 +987,8 @@ def create_app() -> web.Application:
     app.router.add_post('/upload', upload_handler)
 
     # REST proxy routes (catches /api/ga/*, /api/*, and /v1/*)
-    app.router.add_get('/api/ga/terminal', terminal_ws_handler)
+    if ptyprocess is not None:
+        app.router.add_get('/api/ga/terminal', terminal_ws_handler)
     app.router.add_route('*', '/api/ga/{tail:.*}', proxy_rest_handler)
     app.router.add_route('*', '/api/{tail:.*}', proxy_rest_handler)
     app.router.add_route('*', '/v1/{tail:.*}', proxy_rest_handler)
