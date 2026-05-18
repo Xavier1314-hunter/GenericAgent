@@ -10,23 +10,40 @@ Endpoints:
   3. REST /api/ga/* → proxy to GA backend (/api/ga/v1/... → /v1/..., /api/ga/... → /api/...)
   4. /health → 200 OK
 """
-import os, sys, json, time, re, asyncio, logging, traceback
+import os, sys, json, time, re, asyncio, logging, traceback, uuid, shutil, tempfile
 from urllib.parse import urlparse, parse_qs, urlencode
 
 import aiohttp
 import socketio
+import ptyprocess
 from aiohttp import web
 
 # ── Config ──────────────────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = SCRIPT_DIR
-STATIC_DIR = os.path.join(PROJECT_ROOT, 'temp', 'ga-web-ui', 'dist', 'client')
+
+# Auto-detect static dir: standalone layout (./dist/client/) or dev layout (./temp/ga-web-ui/dist/client/)
+_STATIC_CANDIDATES = [
+    os.path.join(SCRIPT_DIR, 'dist', 'client'),       # standalone package
+    os.path.join(PROJECT_ROOT, 'temp', 'ga-web-ui', 'dist', 'client'),  # dev
+    os.path.join(SCRIPT_DIR, '..', 'dist', 'client'), # fallback
+]
+STATIC_DIR = None
+for _c in _STATIC_CANDIDATES:
+    if os.path.isdir(_c):
+        STATIC_DIR = _c
+        break
+if STATIC_DIR is None:
+    STATIC_DIR = _STATIC_CANDIDATES[0]  # default to first, will show warning
 PORT = int(os.environ.get('PROXY_PORT', '18666'))
 UPSTREAM_BASE = os.environ.get('GA_UPSTREAM', 'http://localhost:8642')
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='[Proxy] %(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('proxy')
+
+# ── Global HTTP Session (shared to prevent connection leak / event loop stall) ──
+HTTP_SESSION: aiohttp.ClientSession = None
 
 # ── Mock Responses for Backend 404s ─────────────────────────────────────────
 # Frontend expects these endpoints; return mock empty data when backend lacks them.
@@ -117,7 +134,7 @@ MOCK_ENDPOINTS = {
     ('GET', '/api/ga/weixin/qrcode/status'): {'status': 'unknown'},
     ('POST', '/api/ga/weixin/save'): {'success': True},
     # Terminal
-    ('GET', '/api/ga/terminal'): {'available': False},
+    ('GET', '/api/ga/terminal'): {'available': True},
     # Model context
     ('GET', '/api/ga/model-context/'): {'contexts': []},
     # Cron history
@@ -256,111 +273,110 @@ class ChatRunNamespace(socketio.AsyncNamespace):
 
         state['is_working'] = True
 
-        async with aiohttp.ClientSession() as client_session:
-            try:
-                # Step 1: POST /v1/runs to start the run
-                run_url = f'{upstream}/v1/runs'
-                headers = {'Content-Type': 'application/json'}
+        try:
+            # Step 1: POST /v1/runs to start the run
+            run_url = f'{upstream}/v1/runs'
+            headers = {'Content-Type': 'application/json'}
 
-                # Get API key if available
-                api_key = os.environ.get('GA_API_KEY', '')
-                if api_key:
-                    headers['Authorization'] = f'Bearer {api_key}'
+            # Get API key if available
+            api_key = os.environ.get('GA_API_KEY', '')
+            if api_key:
+                headers['Authorization'] = f'Bearer {api_key}'
 
-                log.info(f'[sio] POST {run_url} (session={session_id})')
+            log.info(f'[sio] POST {run_url} (session={session_id})')
 
-                async with client_session.post(run_url, json=body, headers=headers) as resp:
-                    if resp.status != 200:
-                        text = await resp.text()
-                        log.error(f'[sio] run failed: {resp.status} {text}')
-                        await self.emit('run.failed', {
-                            'event': 'run.failed',
-                            'session_id': session_id,
-                            'error': f'Upstream {resp.status}: {text}',
-                            'queue_remaining': len(state['queue']),
-                        }, to=sid)
-                        state['is_working'] = False
-                        return
-
-                    run_data = await resp.json()
-                    run_id = run_data.get('run_id')
-                    if not run_id:
-                        log.error(f'[sio] No run_id in response: {run_data}')
-                        await self.emit('run.failed', {
-                            'event': 'run.failed',
-                            'session_id': session_id,
-                            'error': 'No run_id in upstream response',
-                            'queue_remaining': len(state['queue']),
-                        }, to=sid)
-                        state['is_working'] = False
-                        return
-
-                    # Map run_id → session_id
-                    run_session_map[run_id] = session_id
-                    state['run_id'] = run_id
-
-                    await self.emit('run.started', {
-                        'event': 'run.started',
+            async with HTTP_SESSION.post(run_url, json=body, headers=headers) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    log.error(f'[sio] run failed: {resp.status} {text}')
+                    await self.emit('run.failed', {
+                        'event': 'run.failed',
                         'session_id': session_id,
-                        'run_id': run_id,
-                        'status': run_data.get('status', 'running'),
-                        'queue_length': len(state['queue']),
+                        'error': f'Upstream {resp.status}: {text}',
+                        'queue_remaining': len(state['queue']),
                     }, to=sid)
+                    state['is_working'] = False
+                    return
 
-                # Step 2: Stream SSE events from /v1/runs/{run_id}/events
-                events_url = f'{upstream}/v1/runs/{run_id}/events'
-                log.info(f'[sio] SSE GET {events_url}')
+                run_data = await resp.json()
+                run_id = run_data.get('run_id')
+                if not run_id:
+                    log.error(f'[sio] No run_id in response: {run_data}')
+                    await self.emit('run.failed', {
+                        'event': 'run.failed',
+                        'session_id': session_id,
+                        'error': 'No run_id in upstream response',
+                        'queue_remaining': len(state['queue']),
+                    }, to=sid)
+                    state['is_working'] = False
+                    return
 
-                async with client_session.get(events_url, headers=headers) as sse_resp:
-                    if sse_resp.status != 200:
-                        log.error(f'[sio] SSE failed: {sse_resp.status}')
-                        await self.emit('run.failed', {
-                            'event': 'run.failed',
-                            'session_id': session_id,
-                            'error': f'SSE {sse_resp.status}',
-                        }, to=sid)
-                        state['is_working'] = False
-                        return
+                # Map run_id → session_id
+                run_session_map[run_id] = session_id
+                state['run_id'] = run_id
 
-                    # Parse SSE stream
-                    buffer = ''
-                    log.info('[sio] Starting SSE read loop...')
-                    async for chunk in sse_resp.content.iter_chunked(4096):
-                        buffer += chunk.decode('utf-8', errors='replace')
-                        # Process complete SSE messages (delimited by \n\n)
-                        while '\n\n' in buffer:
-                            msg_block, buffer = buffer.split('\n\n', 1)
-                            await self._process_sse_message(msg_block, sid, session_id, run_id)
-
-                    # Process remaining buffer
-                    if buffer.strip():
-                        await self._process_sse_message(buffer, sid, session_id, run_id)
-
-            except asyncio.CancelledError:
-                log.info(f'[sio] run cancelled: {run_id}')
-                # Optionally abort upstream
-                if run_id:
-                    try:
-                        abort_url = f'{upstream}/v1/runs/{run_id}/cancel'
-                        async with client_session.post(abort_url, headers=headers): pass
-                    except Exception:
-                        pass
-                await self.emit('abort.completed', {'event': 'abort.completed', 'session_id': session_id, 'run_id': run_id}, to=sid)
-            except Exception as e:
-                log.error(f'[sio] run error: {traceback.format_exc()}')
-                await self.emit('run.failed', {
-                    'event': 'run.failed',
+                await self.emit('run.started', {
+                    'event': 'run.started',
                     'session_id': session_id,
-                    'error': str(e),
+                    'run_id': run_id,
+                    'status': run_data.get('status', 'running'),
+                    'queue_length': len(state['queue']),
                 }, to=sid)
-            finally:
-                state['is_working'] = False
-                state['run_id'] = None
 
-                # Dequeue next if any
-                if state['queue']:
-                    next_run = state['queue'].pop(0)
-                    asyncio.ensure_future(self.on_run(next_run['sid'], next_run['data']))
+            # Step 2: Stream SSE events from /v1/runs/{run_id}/events
+            events_url = f'{upstream}/v1/runs/{run_id}/events'
+            log.info(f'[sio] SSE GET {events_url}')
+
+            async with HTTP_SESSION.get(events_url, headers=headers) as sse_resp:
+                if sse_resp.status != 200:
+                    log.error(f'[sio] SSE failed: {sse_resp.status}')
+                    await self.emit('run.failed', {
+                        'event': 'run.failed',
+                        'session_id': session_id,
+                        'error': f'SSE {sse_resp.status}',
+                    }, to=sid)
+                    state['is_working'] = False
+                    return
+
+                # Parse SSE stream
+                buffer = ''
+                log.info('[sio] Starting SSE read loop...')
+                async for chunk in sse_resp.content.iter_chunked(4096):
+                    buffer += chunk.decode('utf-8', errors='replace')
+                    # Process complete SSE messages (delimited by \n\n)
+                    while '\n\n' in buffer:
+                        msg_block, buffer = buffer.split('\n\n', 1)
+                        await self._process_sse_message(msg_block, sid, session_id, run_id)
+
+                # Process remaining buffer
+                if buffer.strip():
+                    await self._process_sse_message(buffer, sid, session_id, run_id)
+
+        except asyncio.CancelledError:
+            log.info(f'[sio] run cancelled: {run_id}')
+            # Optionally abort upstream
+            if run_id:
+                try:
+                    abort_url = f'{upstream}/v1/runs/{run_id}/cancel'
+                    async with HTTP_SESSION.post(abort_url, headers=headers): pass
+                except Exception:
+                    pass
+            await self.emit('abort.completed', {'event': 'abort.completed', 'session_id': session_id, 'run_id': run_id}, to=sid)
+        except Exception as e:
+            log.error(f'[sio] run error: {traceback.format_exc()}')
+            await self.emit('run.failed', {
+                'event': 'run.failed',
+                'session_id': session_id,
+                'error': str(e),
+            }, to=sid)
+        finally:
+            state['is_working'] = False
+            state['run_id'] = None
+
+            # Dequeue next if any
+            if state['queue']:
+                next_run = state['queue'].pop(0)
+                asyncio.ensure_future(self.on_run(next_run['sid'], next_run['data']))
 
     async def on_abort(self, sid, data):
         """Client requests abort of current run."""
@@ -522,23 +538,16 @@ async def proxy_rest_handler(request: web.Request) -> web.Response:
         except Exception:
             body = None
 
-    # ── Check mock data before hitting backend ──
-    mock_data = get_mock_response(request.method, path)
-    if mock_data is not None:
-        log.info(f'[proxy] mock {request.method} {path} (backend unavailable)')
-        return web.json_response(mock_data)
-
     log.info(f'[proxy] {request.method} {path} → {upstream_path}')
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.request(
-                method=request.method,
-                url=url,
-                headers=headers,
-                data=body,
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as resp:
+        async with HTTP_SESSION.request(
+            method=request.method,
+            url=url,
+            headers=headers,
+            data=body,
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
                 # Build response
                 resp_headers = {}
                 for k, v in resp.headers.items():
@@ -677,10 +686,283 @@ async def static_handler(request: web.Request) -> web.Response:
     return web.Response(status=404, text='Not Found')
 
 
+# ── Download Handler ──────────────────────────────────────────────────────────
+async def download_handler(request: web.Request) -> web.Response:
+    """Serve GA-UI-Standalone.zip for download."""
+    zip_path = os.path.join(SCRIPT_DIR, 'temp', 'GA-UI-Standalone.zip')
+    if not os.path.isfile(zip_path):
+        return web.Response(status=404, text='Not Found')
+    try:
+        data = open(zip_path, 'rb').read()
+        return web.Response(
+            body=data,
+            content_type='application/zip',
+            headers={
+                'Content-Disposition': f'attachment; filename="GA-UI-Standalone.zip"',
+                'Content-Length': str(len(data)),
+            }
+        )
+    except IOError:
+        return web.Response(status=500, text='Server Error')
+
+
+# ── Upload Handler ───────────────────────────────────────────────────────────
+# Frontend sends POST /upload with FormData file fields.
+# Returns {"files": [{"name": "...", "path": "...", "media_type": "..."}]}
+
+UPLOAD_DIR = os.path.join(SCRIPT_DIR, 'temp', 'uploads')
+
+async def upload_handler(request: web.Request) -> web.Response:
+    """Handle file upload from the frontend. Saves files to temp/uploads/."""
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    reader = await request.multipart()
+    files = []
+    while True:
+        field = await reader.next()
+        if field is None:
+            break
+        if field.name != 'file':
+            continue
+        # Generate unique filename to avoid collisions
+        original_name = field.filename or f'upload_{uuid.uuid4().hex[:8]}'
+        ext = os.path.splitext(original_name)[1] or ''
+        unique_name = f'{uuid.uuid4().hex}{ext}'
+        filepath = os.path.join(UPLOAD_DIR, unique_name)
+        # Stream write
+        with open(filepath, 'wb') as f:
+            while True:
+                chunk = await field.read_chunk()
+                if not chunk:
+                    break
+                f.write(chunk)
+        # Determine media type from extension
+        ext_lower = ext.lower()
+        media_type = 'application/octet-stream'
+        if ext_lower in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'):
+            media_type = f'image/{ext_lower[1:]}' if ext_lower != '.jpg' else 'image/jpeg'
+        files.append({
+            'name': original_name,
+            'path': filepath,
+            'media_type': media_type,
+        })
+        log.info(f'[upload] saved: {original_name} → {filepath}')
+    return web.json_response({'files': files})
+
+
+# ── Terminal WebSocket (ptyprocess) ────────────────────────────────────────
+
+def _find_shell():
+    candidates = [os.environ.get('SHELL'), '/bin/zsh', '/bin/bash', '/bin/sh']
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return '/bin/bash'
+
+def _shell_name(shell):
+    return shell.split('/')[-1] or 'shell'
+
+def _gen_id():
+    import random, string
+    ts = hex(int(time.time() * 1000))[2:]
+    rand = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    return ts + rand
+
+class TerminalSession:
+    __slots__ = ('id', 'proc', 'shell', 'pid', 'created_at')
+    def __init__(self, sid, proc, shell, pid):
+        self.id = sid
+        self.proc = proc
+        self.shell = shell
+        self.pid = pid
+        self.created_at = time.time()
+
+async def terminal_ws_handler(request: web.Request) -> web.WebSocketResponse:
+    """WebSocket handler for /api/ga/terminal — multi-session xterm.js via ptyprocess."""
+    ws = web.WebSocketResponse(max_msg_size=0)
+    await ws.prepare(request)
+    log.info('[terminal] WebSocket connected')
+
+    shell_path = _find_shell()
+    sessions: dict[str, TerminalSession] = {}
+    active_id: str | None = None
+    buf: dict[str, list[str]] = {}
+
+    def _create_session():
+        nonlocal active_id
+        sid = _gen_id()
+        try:
+            proc = ptyprocess.PtyProcess.spawn([shell_path])
+        except Exception as e:
+            log.error('[terminal] spawn failed: %s', e)
+            raise
+        sess = TerminalSession(sid, proc, shell_path, proc.pid)
+        sessions[sid] = sess
+        active_id = sid
+
+        # Reader task: forward pty output to ws (only active session)
+        async def _reader():
+            loop = asyncio.get_event_loop()
+            try:
+                while True:
+                    try:
+                        data = await loop.run_in_executor(None, proc.read, 65536)
+                    except (EOFError, OSError):
+                        break
+                    if not data:
+                        break
+                    text = data.decode('utf-8', errors='replace')
+                    if ws.closed:
+                        break
+                    if active_id == sess.id:
+                        try:
+                            await ws.send_str(text)
+                        except Exception:
+                            break
+                    else:
+                        b = buf.setdefault(sess.id, [])
+                        b.append(text)
+                        if len(b) > 5000:
+                            b[:] = b[-5000:]
+                # Process exited
+                if not ws.closed:
+                    try:
+                        await ws.send_json({'type': 'exited', 'id': sess.id, 'exitCode': proc.exitcode or 0})
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            finally:
+                buf.pop(sess.id, None)
+                sessions.pop(sess.id, None)
+
+        asyncio.ensure_future(_reader())
+        log.info('[terminal] session created: %s (pid %d)', sess.id, sess.pid)
+        return sess
+
+    def _write_raw(data: str):
+        if active_id and active_id in sessions:
+            try:
+                sessions[active_id].proc.write(data.encode('utf-8'))
+            except Exception:
+                pass
+
+    # Create first session
+    try:
+        first = _create_session()
+        await ws.send_json({
+            'type': 'created',
+            'id': first.id,
+            'pid': first.pid,
+            'shell': _shell_name(shell_path),
+        })
+    except Exception as e:
+        await ws.send_json({'type': 'error', 'message': f'Failed to create shell: {e}'})
+        await ws.close()
+        return ws
+
+    async for msg in ws:
+        if msg.type == aiohttp.WSMsgType.TEXT:
+            raw = msg.data
+            if not raw:
+                continue
+            # JSON control message (starts with {)
+            if raw and raw[0] == '{':
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError:
+                    _write_raw(raw)
+                    continue
+                cmd = parsed.get('type')
+                if cmd == 'create':
+                    try:
+                        sess = _create_session()
+                        await ws.send_json({
+                            'type': 'created',
+                            'id': sess.id,
+                            'pid': sess.pid,
+                            'shell': _shell_name(shell_path),
+                        })
+                    except Exception as e:
+                        await ws.send_json({'type': 'error', 'message': str(e)})
+                elif cmd == 'switch':
+                    sid = parsed.get('sessionId')
+                    if sid in sessions:
+                        active_id = sid
+                        await ws.send_json({'type': 'switched', 'id': sid})
+                        # Flush buffered output
+                        b = buf.pop(sid, None)
+                        if b:
+                            for chunk in b:
+                                try:
+                                    await ws.send_str(chunk)
+                                except Exception:
+                                    break
+                    else:
+                        await ws.send_json({'type': 'error', 'message': 'Session not found'})
+                elif cmd == 'close':
+                    sid = parsed.get('sessionId')
+                    if sid in sessions:
+                        try:
+                            sessions[sid].proc.close()
+                        except Exception:
+                            pass
+                        sessions.pop(sid, None)
+                        buf.pop(sid, None)
+                        if active_id == sid:
+                            remaining = list(sessions.keys())
+                            active_id = remaining[0] if remaining else None
+                        log.info('[terminal] session closed: %s', sid)
+                elif cmd == 'resize':
+                    if active_id and active_id in sessions:
+                        cols = max(1, parsed.get('cols', 0))
+                        rows = max(1, parsed.get('rows', 0))
+                        try:
+                            sessions[active_id].proc.setwinsize(rows, cols)
+                        except Exception:
+                            pass
+                else:
+                    _write_raw(raw)
+            else:
+                _write_raw(raw)
+        elif msg.type == aiohttp.WSMsgType.ERROR:
+            log.error('[terminal] ws error: %s', ws.exception())
+
+    # Cleanup on disconnect
+    for s in list(sessions.values()):
+        try:
+            s.proc.close()
+        except Exception:
+            pass
+    sessions.clear()
+    buf.clear()
+    log.info('[terminal] WebSocket disconnected, all sessions cleaned up')
+    return ws
+
+
 # ── App Creation ────────────────────────────────────────────────────────────
+
+async def _init_session(app):
+    """Initialize global HTTP session on app startup."""
+    global HTTP_SESSION
+    HTTP_SESSION = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=60),
+        connector=aiohttp.TCPConnector(limit=50, limit_per_host=20, enable_cleanup_closed=True),
+    )
+    log.info('[session] Global HTTP session created')
+
+async def _cleanup_session(app):
+    """Close global HTTP session on app shutdown."""
+    global HTTP_SESSION
+    if HTTP_SESSION and not HTTP_SESSION.closed:
+        await HTTP_SESSION.close()
+        log.info('[session] Global HTTP session closed')
 
 def create_app() -> web.Application:
     app = web.Application()
+
+    # Global session lifecycle
+    app.on_startup.append(_init_session)
+    app.on_cleanup.append(_cleanup_session)
 
     # Socket.IO
     sio.attach(app)
@@ -693,7 +975,14 @@ def create_app() -> web.Application:
     # Routes
     app.router.add_get('/health', health_handler)
 
+    # Download endpoint: server GA-UI-Standalone.zip
+    app.router.add_get('/download/ga-ui-standalone', download_handler)
+
+    # Upload endpoint (must be before static catch-all)
+    app.router.add_post('/upload', upload_handler)
+
     # REST proxy routes (catches /api/ga/*, /api/*, and /v1/*)
+    app.router.add_get('/api/ga/terminal', terminal_ws_handler)
     app.router.add_route('*', '/api/ga/{tail:.*}', proxy_rest_handler)
     app.router.add_route('*', '/api/{tail:.*}', proxy_rest_handler)
     app.router.add_route('*', '/v1/{tail:.*}', proxy_rest_handler)

@@ -60,6 +60,7 @@ def _init_db():
             content TEXT NOT NULL,
             run_id TEXT,
             created_at REAL NOT NULL,
+            attachments_json TEXT DEFAULT '',
             FOREIGN KEY (session_id) REFERENCES sessions(id)
         );
         CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
@@ -72,12 +73,12 @@ def _init_db():
     """)
     conn.commit()
 
-def db_save_user_message(session_id: str, content: str, run_id: str = '') -> None:
+def db_save_user_message(session_id: str, content: str, run_id: str = '', attachments_json: str = '') -> None:
     conn = get_db()
     with _conn_lock:
         conn.execute(
-            'INSERT INTO messages (session_id, role, content, run_id, created_at) VALUES (?, ?, ?, ?, ?)',
-            (session_id, 'user', content, run_id, time.time())
+            'INSERT INTO messages (session_id, role, content, run_id, created_at, attachments_json) VALUES (?, ?, ?, ?, ?, ?)',
+            (session_id, 'user', content, run_id, time.time(), attachments_json)
         )
         # Increment & ensure session exists
         conn.execute('UPDATE sessions SET message_count = message_count + 1, last_active = ? WHERE id = ?',
@@ -129,10 +130,25 @@ def db_ensure_session(session_id: str, title: str = '', model: str = '', started
 def db_get_messages(session_id: str) -> list[dict]:
     conn = get_db()
     rows = conn.execute(
-        'SELECT role, content, run_id, created_at FROM messages WHERE session_id = ? ORDER BY id ASC',
+        'SELECT role, content, run_id, created_at, attachments_json FROM messages WHERE session_id = ? ORDER BY id ASC',
         (session_id,)
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def db_get_session_detail(session_id: str) -> dict | None:
+    """Fetch a single session with its messages."""
+    conn = get_db()
+    row = conn.execute(
+        'SELECT id, title, source, model, started_at, last_active, message_count FROM sessions WHERE id = ?',
+        (session_id,)
+    ).fetchone()
+    if not row:
+        return None
+    s = dict(row)
+    s['messages'] = db_get_messages(session_id)
+    return s
+
 
 def db_get_sessions() -> list[dict]:
     conn = get_db()
@@ -274,6 +290,30 @@ async def handle_post_run(request: web.Request) -> web.Response:
     session_id = body.get('session_id', '')
     model = body.get('model', '')
     
+    # Handle array input from frontend (text + images format)
+    # e.g. [{"type":"text","text":"hello"}, {"type":"image","name":"x.png","path":"/tmp/..."}]
+    attachments_json = ''
+    if isinstance(input_text, list):
+        # Save original content blocks as attachments_json before flattening
+        attachments_json = json.dumps(input_text, ensure_ascii=False)
+        text_parts = []
+        for item in input_text:
+            if isinstance(item, dict) and item.get('type') == 'text':
+                text_parts.append(item.get('text', ''))
+            elif isinstance(item, dict) and item.get('type') == 'image':
+                img_path = item.get('path', '')
+                if img_path and os.path.exists(img_path):
+                    try:
+                        from memory.ocr_utils import ocr_image
+                        ocr_result = ocr_image(img_path)
+                        ocr_text = ocr_result.get('text', '').strip()
+                        if ocr_text:
+                            text_parts.append(f"[截图内容]:\n{ocr_text}")
+                            log.info(f'[ocr] extracted {len(ocr_text)} chars from {img_path}')
+                    except Exception as e:
+                        log.warning(f'[ocr] failed on {img_path}: {e}')
+        input_text = '\n'.join(text_parts)
+    
     if not input_text:
         return web.json_response({'error': 'input is required'}, status=400)
     
@@ -309,7 +349,7 @@ async def handle_post_run(request: web.Request) -> web.Response:
     run_id = str(uuid.uuid4())
     
     # Store user message
-    db_save_user_message(session_id, input_text, run_id)
+    db_save_user_message(session_id, input_text, run_id, attachments_json)
     
     # Initialize stream buffer
     _stream_buffers[run_id] = {
@@ -441,6 +481,21 @@ async def handle_get_sessions(request: web.Request) -> web.Response:
         return web.json_response([], status=200)
 
 
+async def handle_get_session(request: web.Request) -> web.Response:
+    """GET /api/sessions/{session_id} - detailed session with messages"""
+    session_id = request.match_info.get('session_id', '')
+    if not session_id:
+        return web.json_response({'error': 'session_id required'}, status=400)
+    try:
+        detail = db_get_session_detail(session_id)
+        if not detail:
+            return web.json_response({'session': None}, status=404)
+        return web.json_response({'session': detail})
+    except Exception as e:
+        log.error(f'Error getting session detail: {e}')
+        return web.json_response({'session': None}, status=200)
+
+
 async def handle_get_session_messages(request: web.Request) -> web.Response:
     """GET /api/sessions/{session_id}/messages - get all messages"""
     session_id = request.match_info.get('session_id', '')
@@ -535,6 +590,7 @@ def create_app() -> web.Application:
     
     # API endpoints
     app.router.add_get('/api/sessions', handle_get_sessions)
+    app.router.add_get('/api/sessions/{session_id}', handle_get_session)
     app.router.add_get('/api/sessions/{session_id}/messages', handle_get_session_messages)
     
     # Legacy compat
