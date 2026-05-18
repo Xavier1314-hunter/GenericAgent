@@ -30,19 +30,20 @@ log = logging.getLogger('proxy')
 
 # ── Mock Responses for Backend 404s ─────────────────────────────────────────
 # Frontend expects these endpoints; return mock empty data when backend lacks them.
+# ── Comprehensive Mock Data ──────────────────────────────────────────────────
+# These ensure the UI is viewable even when the backend is offline.
 MOCK_ENDPOINTS = {
     # Skills
     ('GET', '/api/ga/skills'): {'categories': [], 'archived': []},
     ('PUT', '/api/ga/skills/toggle'): {'success': True},
     ('PUT', '/api/ga/skills/pin'): {'success': True},
-    # Usage (frontend calls /api/ga/usage directly)
+    # Usage
     ('GET', '/api/ga/usage'): {
         'sessions': [], 'daily': [], 'models': {},
         'total_input_tokens': 0, 'total_output_tokens': 0,
         'total_sessions': 0, 'total_errors': 0,
         'total_cache_read_tokens': 0, 'total_cache_write_tokens': 0,
     },
-    # Sessions
     ('GET', '/api/ga/sessions/usage'): {
         'sessions': [], 'daily': [], 'models': {},
         'total_input_tokens': 0, 'total_output_tokens': 0,
@@ -50,6 +51,23 @@ MOCK_ENDPOINTS = {
         'total_cache_read_tokens': 0, 'total_cache_write_tokens': 0,
     },
     ('GET', '/api/ga/sessions/context-length'): {'context_length': 4096},
+    # Sessions list / conversations
+    ('GET', '/api/ga/sessions'): {'sessions': [], 'total': 0},
+    ('GET', '/api/ga/sessions/conversations'): {'conversations': []},
+    ('POST', '/api/ga/sessions/batch-delete'): {'success': True},
+    # Memory
+    ('GET', '/api/ga/memory'): {'entries': [], 'stats': {}},
+    # Config
+    ('GET', '/api/ga/config'): {
+        'platforms': {}, 'providers': [], 'model': {},
+        'session_reset': {}, 'approvals': {},
+    },
+    ('GET', '/api/ga/config/providers'): {'providers': []},
+    ('GET', '/api/ga/config/model'): {'model': None},
+    ('GET', '/api/ga/config/credentials'): {'credentials': []},
+    # Models
+    ('GET', '/api/ga/available-models'): {'groups': []},
+    ('GET', '/v1/models'): {'data': []},
     # Logs
     ('GET', '/api/ga/logs'): {'files': []},
     # Gateways
@@ -59,8 +77,55 @@ MOCK_ENDPOINTS = {
     ('GET', '/api/auth/status'): {'hasPasswordLogin': False, 'username': None},
     ('GET', '/api/auth/locked-ips'): {'ips': [], 'locks': {}},
     ('DELETE', '/api/auth/locked-ips'): {'count': 0},
+    ('POST', '/api/auth/change-password'): {'success': True},
+    ('POST', '/api/auth/change-username'): {'success': True},
+    ('POST', '/api/auth/setup'): {'success': True},
+    # Files
+    ('GET', '/api/ga/files/list'): {'files': [], 'path': '/'},
+    ('GET', '/api/ga/files/read'): {'content': '', 'path': ''},
+    ('POST', '/api/ga/files/write'): {'success': True},
+    ('POST', '/api/ga/files/delete'): {'success': True},
+    ('POST', '/api/ga/files/rename'): {'success': True},
+    ('POST', '/api/ga/files/mkdir'): {'success': True},
+    ('POST', '/api/ga/files/copy'): {'success': True},
+    # Profiles
+    ('GET', '/api/ga/profiles'): {'profiles': []},
+    ('GET', '/api/ga/profiles/active'): {'profile': None},
+    ('POST', '/api/ga/profiles/import'): {'success': True},
+    # Kanban
+    ('GET', '/api/ga/kanban'): {'columns': []},
+    ('POST', '/api/ga/kanban'): {'success': True},
+    ('GET', '/api/ga/kanban/assignees'): {'assignees': []},
+    ('POST', '/api/ga/kanban/complete'): {'success': True},
+    ('POST', '/api/ga/kanban/unblock'): {'success': True},
+    # Jobs
+    ('GET', '/api/ga/jobs'): {'jobs': []},
+    # Workspace
+    ('GET', '/api/ga/workspace/folders'): {'folders': []},
+    # Group chat
+    ('GET', '/api/ga/group-chat/rooms'): {'rooms': []},
+    # Search
+    ('GET', '/api/ga/search/sessions'): {'sessions': [], 'total': 0},
+    # TTS
+    ('GET', '/api/ga/tts'): {'voices': []},
+    # Update
+    ('GET', '/api/ga/update'): {'current': '', 'latest': ''},
+    # Stats
+    ('GET', '/api/ga/usage/stats'): {'stats': {}},
+    # Weixin
+    ('GET', '/api/ga/weixin/qrcode'): {'qrcode': None},
+    ('GET', '/api/ga/weixin/qrcode/status'): {'status': 'unknown'},
+    ('POST', '/api/ga/weixin/save'): {'success': True},
+    # Terminal
+    ('GET', '/api/ga/terminal'): {'available': False},
+    # Model context
+    ('GET', '/api/ga/model-context/'): {'contexts': []},
+    # Cron history
+    ('GET', '/api/cron-history'): {'entries': []},
+    # Download
+    ('GET', '/api/ga/download'): {'files': []},
 }
-# Regex patterns for dynamic paths
+# Regex patterns for dynamic paths (ID-specific endpoints)
 MOCK_PATTERNS = [
     (re.compile(r'^GET /api/ga/logs/[^/]+$'), {'entries': []}),
     (re.compile(r'^GET /api/ga/gateways/[^/]+/health$'), {
@@ -69,6 +134,20 @@ MOCK_PATTERNS = [
     (re.compile(r'^(POST|DELETE) /api/ga/gateways/[^/]+$'), {'success': True}),
     (re.compile(r'^GET /api/ga/skills/[^/]+/files$'), {'files': []}),
     (re.compile(r'^GET /api/ga/skills/[^/]+$'), {'content': ''}),
+    (re.compile(r'^GET /api/ga/sessions/[^/]+$'), {'session': None}),
+    (re.compile(r'^(POST|DELETE) /api/ga/sessions/[^/]+$'), {'success': True}),
+    (re.compile(r'^GET /api/ga/sessions/ga/[^/]+$'), {'response': None}),
+    (re.compile(r'^GET /api/ga/profiles/[^/]+$'), {'profile': None}),
+    (re.compile(r'^(POST|PUT|DELETE) /api/ga/profiles/[^/]+$'), {'success': True}),
+    (re.compile(r'^GET /api/ga/jobs/[^/]+$'), {'job': None}),
+    (re.compile(r'^POST /api/ga/jobs/[^/]+$'), {'success': True}),
+    (re.compile(r'^GET /api/ga/kanban/[^/]+$'), {'column': None}),
+    (re.compile(r'^(POST|PUT|DELETE) /api/ga/kanban/[^/]+$'), {'success': True}),
+    (re.compile(r'^GET /api/ga/group-chat/rooms/[^/]+$'), {'room': None}),
+    (re.compile(r'^POST /api/ga/group-chat/rooms/[^/]+/join/'), {'joined': True}),
+    (re.compile(r'^GET /api/ga/config/providers/[^/]+$'), {'provider': None}),
+    (re.compile(r'^GET /api/ga/model-context/[^/]+$'), {'context': {}}),
+    (re.compile(r'^GET /api/cron-history/[^/]+$'), {'entries': []}),
 ]
 
 
@@ -534,10 +613,14 @@ async def proxy_rest_handler(request: web.Request) -> web.Response:
                 )
     except aiohttp.ClientError as e:
         log.error(f'[proxy] connection error to {upstream}: {e}')
-        return web.json_response(
-            {'error': {'message': f'Proxy error: {e}'}},
-            status=502,
-        )
+        # Offline mode: try mock data first, fallback to empty JSON
+        mock_data = get_mock_response(request.method, path)
+        if mock_data is not None:
+            log.info(f'[proxy] offline → mock response for {request.method} {path}')
+            return web.json_response(mock_data, status=200)
+        # Return empty JSON to prevent frontend crash in standalone UI mode
+        log.info(f'[proxy] offline → empty response for {request.method} {path}')
+        return web.json_response({}, status=200)
 
 
 # ── Health Check ────────────────────────────────────────────────────────────
