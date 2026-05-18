@@ -612,6 +612,8 @@ def handle_command(open_id, cmd, chat_id=None):
             _send_cmd_response(f"恢复失败: {e}")
     elif cmd.startswith("/continue"):
         _send_cmd_response(handle_continue_frontend(agent, cmd))
+    elif cmd.startswith("/name"):
+        _send_cmd_response(handle_continue_frontend(agent, cmd))
     else:
         _send_cmd_response(f"未知命令: {cmd}")
 

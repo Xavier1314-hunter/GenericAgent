@@ -1,6 +1,19 @@
 # 自主行动 SOP
 
 ⚠️ **路径警告**：autonomous_reports 在 temp/ 下，用`./autonomous_reports/`访问，**不是**`../memory/autonomous_reports/`或`../autonomous_reports/`！TODO在cwd下。
+
+> 📌 **agentmain.py --task 模式正确调用方式**（2026-05-08 验证）：
+> ```python
+> # ✅ 正确
+> proc = subprocess.Popen(
+>     ['python3', 'agentmain.py', '--task', io_dir, '--once'],
+>     cwd=script_dir, stdout=fout, stderr=ferr, start_new_session=True
+> )
+> # ❌ 错误（缺少--task关键字，agentmain把io_dir当作positional参数→--input模式等待stdin）
+>
+> # --once标志：处理完一轮后立即退出，不等待reply.txt（避免300×2s空等）
+> # 旧bug：无--once时若reply.txt不存在，agent会空等10分钟
+> ```
 报告存于 `./autonomous_reports/`，文件名 `RXX_简短描述.md`（XX从 history.txt 推断自增）。
 
 授权你进行自主行动，只要不对环境造成副作用都可进行。

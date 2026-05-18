@@ -149,9 +149,11 @@ class TMWebDriver:
                     elif data.get('type') == 'error':  
                         driver.results[data.get('id')] = {'success': False, 'data': data.get('error'), 'newTabs': data.get('newTabs', [])}  
                 except Exception as e:  
+                    import traceback
                     print(f"Error handling message: {e}")  
-                    if hasattr(self, 'data'): print(self.data)  
-            def connected(self): (f"New connection from {self.address}")  
+                    traceback.print_exc()
+                    if hasattr(self, 'data'): print(f"Raw data: {repr(self.data)}")  
+            def connected(self): print(f"New connection from {self.address}")  
             def handle_close(self): 
                 print(f"WS Connection closed: {self.address}")
                 driver._unregister_client(self)  
@@ -281,5 +283,9 @@ class TMWebDriver:
         if url is None: url = "http://www.baidu.com/robots.txt"
         return self.execute_js(f'GM_openInTab("{url}");')
     
-if __name__ == "__main__":
-    driver = TMWebDriver(host='127.0.0.1', port=18765)
+if __name__ == '__main__':
+    import time
+    driver = TMWebDriver(host='0.0.0.0', port=18765)
+    print('TMWebDriver ready, keeping alive...')
+    while True:
+        time.sleep(3600)

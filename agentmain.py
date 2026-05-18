@@ -3,7 +3,9 @@ os.environ.setdefault('GA_LANG', 'zh' if any(k in (locale.getlocale()[0] or '').
 if sys.stdout is None: sys.stdout = open(os.devnull, "w")
 elif hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(errors='replace')
 if sys.stderr is None: sys.stderr = open(os.devnull, "w")
-elif hasattr(sys.stderr, 'reconfigure'): sys.stderr.reconfigure(errors='replace')
+elif hasattr(sys.stderr, 'reconfigure'):
+    try: sys.stderr.reconfigure(errors='replace')
+    except: pass
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from llmcore import LLMSession, ToolClient, ClaudeSession, MixinSession, NativeToolClient, NativeClaudeSession, NativeOAISession
@@ -249,7 +251,7 @@ if __name__ == '__main__':
     else:
         agent.inc_out = True
         while True:
-            q = input('> ').strip()
+            pass  # input disabled for streamlit
             if not q: continue
             try:
                 dq = agent.put_task(q, source='user')

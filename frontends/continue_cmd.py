@@ -8,6 +8,20 @@ _LOG_GLOB = os.path.join(_LOG_DIR, 'model_responses_*.txt')
 _BLOCK_RE = re.compile(r'^=== (Prompt|Response) ===.*?\n(.*?)(?=^=== (?:Prompt|Response) ===|\Z)',
                        re.DOTALL | re.MULTILINE)
 _SUMMARY_RE = re.compile(r'<summary>\s*(.*?)\s*</summary>', re.DOTALL)
+_NAMES_FILE = os.path.join(os.path.dirname(_LOG_DIR), 'session_names.json')
+
+def _load_names():
+    try:
+        with open(_NAMES_FILE, encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def _get_name(path):
+    """Return session display name if set, else None."""
+    names = _load_names()
+    basename = os.path.basename(path)
+    return names.get(basename)
 
 def _rel_time(mtime):
     d = int(time.time() - mtime)
@@ -164,13 +178,93 @@ def reset_conversation(agent, message='🆕 已开启新对话，当前上下文
         agent.handler = None
     return message
 
-def format_list(sessions, limit=20):
+def format_list(sessions, limit=999, include_current=True):
     if not sessions: return '❌ 没有可恢复的历史会话'
-    lines = ['**可恢复会话**（输入 `/continue N` 恢复第 N 个）：', '']
-    for i, (_, mtime, first, n) in enumerate(sessions[:limit], 1):
-        preview = _escape_md((first or '（无法预览）').replace('\n', ' ')[:60])
-        lines.append(f'{i}. `{_rel_time(mtime)}` · **{n} 轮** · {preview}')
+    lines = ['**可恢复会话**（输入 `/continue N` 恢复第 N 个）：', '',
+             '| # | 名称 | 时间 | 轮数 |',
+             '|---|------|------|------|']
+    names = _load_names()
+    start_idx = 1
+
+    # Prepend current session (not yet on disk) if it has a name
+    if include_current:
+        cur_file = f'model_responses_{os.getpid()}.txt'
+        cur_name = names.get(cur_file)
+        if cur_name and not any(cur_file == os.path.basename(p) for p, _, _, _ in sessions):
+            lines.append(f'| 0 | **{cur_name}** | 进行中 | 当前 |')
+            sessions.insert(0, (os.path.join(_LOG_DIR, cur_file), time.time(), '', 0))
+            start_idx = 0
+
+    for i, (path, mtime, first, n) in enumerate(sessions[:limit], start_idx):
+        name = _get_name(path)
+        name_tag = f'**{name}**' if name else ''
+        lines.append(f'| {i} | {name_tag} | {_rel_time(mtime)} | {n}轮 |')
     return '\n'.join(lines)
+
+def handle_name_cmd(query, exclude_pid=None):
+    """/name — list names; /name <name> — rename current session; /name <N> <name> — rename session N."""
+    import subprocess as _sp
+    parts = query.split(maxsplit=2)
+    names_file = _NAMES_FILE
+    names = _load_names()
+    exclude_pid = os.getpid() if exclude_pid is None else exclude_pid
+
+    # /name (list all named sessions)
+    if len(parts) == 1:
+        sessions = list_sessions(exclude_pid=exclude_pid)
+        # Also include the current (unwritten) session
+        cur_pid = exclude_pid
+        cur_file = f'model_responses_{cur_pid}.txt'
+        # check if current pid already has a name
+        all_items = []
+        for path, mtime, first, n in sessions:
+            bn = os.path.basename(path)
+            name = names.get(bn)
+            all_items.append((bn, mtime, name, n, '✅'))
+        # add current session if not in list
+        if cur_file not in {os.path.basename(p) for p, _, _, _ in sessions}:
+            all_items.insert(0, (cur_file, os.path.getmtime(names_file) if os.path.exists(names_file) else 0,
+                                names.get(cur_file), 0, '⏳'))
+        if not any(v[2] for v in all_items):
+            return '❌ 没有已命名的会话\n用 `/name <名称>` 为当前会话命名'
+        lines = ['**📋 命名列表**:', '',
+                  '| # | 状态 | 名称 | 时间 | 轮数 |',
+                  '|---|------|------|------|------|']
+        for idx, (bn, mtime, nm, n, flag) in enumerate(all_items, 1):
+            if not nm:
+                continue
+            time_str = _rel_time(mtime) if flag == '✅' else '进行中'
+            lines.append(f'| {idx} | {flag} | **{nm}** | {time_str} | {n}轮 |')
+        return '\n'.join(lines)
+
+    # /name <name> — rename current session
+    if len(parts) == 2:
+        new_name = parts[1].strip()
+        if not new_name:
+            return '❌ 名称为空'
+        cur_file = f'model_responses_{exclude_pid}.txt'
+        names[cur_file] = new_name
+        with open(names_file, 'w', encoding='utf-8') as f:
+            json.dump(names, f, ensure_ascii=False, indent=2)
+        return f'✅ 当前会话已重命名为 **{new_name}**'
+
+    # /name <N> <name> — rename session N from list
+    if len(parts) >= 3 and parts[1].isdigit():
+        idx = int(parts[1]) - 1
+        sessions = list_sessions(exclude_pid=exclude_pid)
+        if not (0 <= idx < len(sessions)):
+            return f'❌ 索引越界（有效范围 1-{len(sessions)}）'
+        target_file = os.path.basename(sessions[idx][0])
+        new_name = parts[2].strip()
+        if not new_name:
+            return '❌ 名称为空'
+        names[target_file] = new_name
+        with open(names_file, 'w', encoding='utf-8') as f:
+            json.dump(names, f, ensure_ascii=False, indent=2)
+        return f'✅ 会话 `{target_file}` 已重命名为 **{new_name}**'
+
+    return '用法: `/name` (列表) | `/name <名称>` (当前会话) | `/name <N> <名称>` (指定会话)'
+
 
 def restore(agent, path):
     """Restore session at path. Returns (msg, is_full)."""
@@ -266,11 +360,13 @@ def extract_ui_messages(path):
 
 
 def handle_frontend_command(agent, query, exclude_pid=None):
-    """Frontend-friendly /continue entry that returns text directly."""
+    """Frontend-friendly /continue and /name entry that returns text directly."""
     s = (query or '').strip()
     exclude_pid = os.getpid() if exclude_pid is None else exclude_pid
     if s == '/continue':
         return format_list(list_sessions(exclude_pid=exclude_pid))
+    if s.startswith('/name'):
+        return handle_name_cmd(s, exclude_pid=exclude_pid)
     m = re.match(r'/continue\s+(\d+)\s*$', s)
     if not m:
         return '用法: /continue 或 /continue N'

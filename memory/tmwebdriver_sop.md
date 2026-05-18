@@ -118,4 +118,7 @@ web_scan失败时按序排查（自动检测优先，用户参与放最后）：
 ②WS后台挂了？→本机18766端口没监听即dead→手动后台`from TMWebDriver import TMWebDriver; TMWebDriver()`起master
 ③扩展没装？→读Chrome用户目录下`Secure Preferences`→`extensions.settings`中找`path`含`tmwd_cdp_bridge`的条目
   找到→扩展已装，排查其他原因；没找到→走web_setup_sop
-④以上都正常仍连不上→请求用户协助
+④WS已连但sessions=0→**检查Chrome是否有`--incognito`参数**，该模式下扩展SW的`chrome.tabs.query({})`返回0个标签页，移除即可
+  - 诊断：CDP连SW监听console日志，搜`[TMWD-WS] Sent ext_ready with`看tabs数量
+  - 其他原因：扩展发的type是`ext_ready`（不是`ready`），TMWebDriver匹配正确(第132行已处理)
+⑤以上都正常仍连不上→请求用户协助
